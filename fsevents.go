@@ -202,12 +202,16 @@ func (es *EventStream) Start() {
 		es.stream = C.EventStreamCreate(&context, cPaths, since, latency, C.FSEventStreamCreateFlags(es.Flags))
 	}
 
+	isStarted := make(chan struct{})
 	go func() {
 		es.rlref = C.CFRunLoopGetCurrent()
 		C.FSEventStreamScheduleWithRunLoop(es.stream, es.rlref, C.kCFRunLoopDefaultMode)
 		C.FSEventStreamStart(es.stream)
+		isStarted <- struct{}{}
 		C.CFRunLoopRun()
 	}()
+	// wait for stream to be started (avoids possible race conditions
+	<-isStarted
 
 	if !es.hasFinalizer {
 		runtime.SetFinalizer(es, finalizer)
