@@ -1,3 +1,6 @@
+// +build darwin
+
+// Package fsevents provides file system notifications on OS X.
 package fsevents
 
 /*
@@ -20,8 +23,16 @@ static FSEventStreamRef EventStreamCreate(FSEventStreamContext * context, CFArra
 }
 */
 import "C"
-import "unsafe"
-import "path/filepath"
+import (
+	"path/filepath"
+	"runtime"
+	"syscall"
+	"time"
+	"unsafe"
+)
+
+// EventIdSinceNow is a sentinel to begin watching events "since now".
+const EventIDSinceNow = uint64(C.kFSEventStreamEventIdSinceNow + (1 << 64))
 
 // CreateFlags for creating a New stream.
 type CreateFlags uint32
@@ -58,8 +69,8 @@ const (
 	UserDropped
 	KernelDropped
 
-	// EventIdsWrapped indicates the 64-bit event ID counter wrapped around.
-	EventIdsWrapped
+	// EventIDsWrapped indicates the 64-bit event ID counter wrapped around.
+	EventIDsWrapped
 
 	// HistoryDone is a sentinel event when retrieving events sinceWhen.
 	HistoryDone
@@ -87,15 +98,18 @@ const (
 	ItemIsSymlink
 )
 
-type FSEvent struct {
+// Event represents a single file system notification.
+type Event struct {
 	Path  string
 	Flags EventFlags
-	Id    uint64
+	ID    uint64
 }
 
 //export fsevtCallback
 func fsevtCallback(stream C.FSEventStreamRef, info unsafe.Pointer, numEvents C.size_t, paths **C.char, flags *C.FSEventStreamEventFlags, ids *C.FSEventStreamEventId) {
-	events := make([]FSEvent, int(numEvents))
+	events := make([]Event, int(numEvents))
+
+	es := (*EventStream)(info)
 
 	for i := 0; i < int(numEvents); i++ {
 		cpaths := uintptr(unsafe.Pointer(paths)) + (uintptr(i) * unsafe.Sizeof(*paths))
@@ -107,54 +121,73 @@ func fsevtCallback(stream C.FSEventStreamRef, info unsafe.Pointer, numEvents C.s
 		cids := uintptr(unsafe.Pointer(ids)) + (uintptr(i) * unsafe.Sizeof(*ids))
 		cid := *(*C.FSEventStreamEventId)(unsafe.Pointer(cids))
 
-		events[i] = FSEvent{Path: C.GoString(cpath), Flags: EventFlags(cflag), Id: uint64(cid)}
+		events[i] = Event{Path: C.GoString(cpath), Flags: EventFlags(cflag), ID: uint64(cid)}
+		// Record the latest EventID to support resuming the stream
+		es.EventID = uint64(cid)
 	}
 
-	evtC := *(*chan []FSEvent)(info)
-	evtC <- events
+	es.Events <- events
 }
 
-/*
-	extern FSEventStreamRef FSEventStreamCreate(
-		CFAllocatorRef allocator,
-		FSEventStreamCallback callback,
-		FSEventStreamContext *context,
-		CFArrayRef pathsToWatch,
-		FSEventStreamEventId sinceWhen,
-		CFTimeInterval latency,
-		FSEventStreamCreateFlags flags);
-
-	typedef void ( *FSEventStreamCallback )(
-		ConstFSEventStreamRef streamRef,
-		void *clientCallBackInfo,
-		size_t numEvents,
-		void *eventPaths,
-		const FSEventStreamEventFlags eventFlags[],
-		const FSEventStreamEventId eventIds[]);
-*/
-
-func FSEventsLatestId() uint64 {
+// LatestEventID returns the most recently generated event ID, system-wide.
+func LatestEventID() uint64 {
 	return uint64(C.FSEventsGetCurrentEventId())
 }
 
-func DeviceForPath(pth string) int64 {
-	cStat := C.struct_stat{}
-	cPath := C.CString(pth)
-	defer C.free(unsafe.Pointer(cPath))
-
-	_ = C.lstat(cPath, &cStat)
-	return int64(cStat.st_dev)
+// DeviceForPath returns the device ID for the specified volume.
+func DeviceForPath(path string) (int32, error) {
+	stat := syscall.Stat_t{}
+	if err := syscall.Lstat(path, &stat); err != nil {
+		return 0, err
+	}
+	return stat.Dev, nil
 }
 
-func GetIdForDeviceBeforeTime(dev, tm int64) uint64 {
-	return uint64(C.FSEventsGetLastEventIdForDeviceBeforeTime(C.dev_t(dev), C.CFAbsoluteTime(tm)))
+// EventIDForDeviceBeforeTime returns an event ID before a given time.
+func EventIDForDeviceBeforeTime(dev int32, before time.Time) uint64 {
+	tm := C.CFAbsoluteTime(before.Unix())
+	return uint64(C.FSEventsGetLastEventIdForDeviceBeforeTime(C.dev_t(dev), tm))
 }
 
-func FSEventsSince(paths []string, dev int64, since uint64) []FSEvent {
-	cPaths := C.ArrayCreateMutable(C.int(len(paths)))
+/*
+
+	Primary EventStream interface.
+	You can provide your own event channel if you wish (or one will be created
+	on Start).
+
+	es := &EventStream{Paths: []string{"/tmp"}, Flags: 0}
+	es.Start()
+	es.Stop()
+
+*/
+
+// EventStream is the primary interface to FSEvents.
+type EventStream struct {
+	stream       C.FSEventStreamRef
+	rlref        C.CFRunLoopRef
+	hasFinalizer bool
+
+	Events  chan []Event
+	Paths   []string
+	Flags   CreateFlags
+	EventID uint64
+	Resume  bool
+	Latency time.Duration
+	Device  int32
+}
+
+func finalizer(es *EventStream) {
+	// If an EventStream is freed without Stop being called it will
+	// cause a panic. This avoids that, and closes the stream instead.
+	es.Stop()
+}
+
+// Start listening to an event stream.
+func (es *EventStream) Start() {
+	cPaths := C.ArrayCreateMutable(C.int(len(es.Paths)))
 	defer C.CFRelease(C.CFTypeRef(cPaths))
 
-	for _, p := range paths {
+	for _, p := range es.Paths {
 		p, _ = filepath.Abs(p)
 		cpath := C.CString(p)
 		defer C.free(unsafe.Pointer(cpath))
@@ -163,97 +196,60 @@ func FSEventsSince(paths []string, dev int64, since uint64) []FSEvent {
 		C.CFArrayAppendValue(cPaths, unsafe.Pointer(str))
 	}
 
-	if since == 0 {
-		/* If since == 0 is passed to FSEventStreamCreate it will mean 'since the beginning of time'.
-		We remap to 'now'. */
-		since = C.kFSEventStreamEventIdSinceNow + (1 << 64)
+	since := C.FSEventStreamEventId(EventIDSinceNow)
+	if es.Resume {
+		since = C.FSEventStreamEventId(es.EventID)
 	}
 
-	evtC := make(chan []FSEvent)
-	context := C.FSEventStreamContext{info: unsafe.Pointer(&evtC)}
+	if es.Events == nil {
+		es.Events = make(chan []Event)
+	}
 
-	latency := C.CFTimeInterval(1.0)
-	var stream C.FSEventStreamRef
-	if dev != 0 {
-		stream = C.EventStreamCreateRelativeToDevice(&context, C.dev_t(dev), cPaths, C.FSEventStreamEventId(since), latency, 0)
+	context := C.FSEventStreamContext{info: unsafe.Pointer(es)}
+	latency := C.CFTimeInterval(float64(es.Latency) / float64(time.Second))
+	if es.Device != 0 {
+		es.stream = C.EventStreamCreateRelativeToDevice(&context, C.dev_t(es.Device), cPaths, since, latency, C.FSEventStreamCreateFlags(es.Flags))
 	} else {
-		stream = C.EventStreamCreate(&context, cPaths, C.FSEventStreamEventId(since), latency, 0)
+		es.stream = C.EventStreamCreate(&context, cPaths, since, latency, C.FSEventStreamCreateFlags(es.Flags))
 	}
-
-	rlref := C.CFRunLoopGetCurrent()
 
 	go func() {
-		/* Schedule the stream on the runloop, then run the runloop concurrently with starting/flushing/stopping the stream */
-		C.FSEventStreamScheduleWithRunLoop(stream, rlref, C.kCFRunLoopDefaultMode)
-		go func() {
-			C.CFRunLoopRun()
-		}()
-		C.FSEventStreamStart(stream)
-		C.FSEventStreamFlushSync(stream)
-		C.FSEventStreamStop(stream)
-		C.FSEventStreamInvalidate(stream)
-		C.FSEventStreamRelease(stream)
-		C.CFRunLoopStop(rlref)
-		close(evtC)
-	}()
-
-	var events []FSEvent
-	for evts := range evtC {
-		events = append(events, evts...)
-	}
-
-	return events
-}
-
-type FSEventStream struct {
-	stream C.FSEventStreamRef
-	rlref  C.CFRunLoopRef
-	C      chan []FSEvent
-}
-
-func NewEventStream(paths []string, since uint64, flags CreateFlags) *FSEventStream {
-	cPaths := C.ArrayCreateMutable(C.int(len(paths)))
-	defer C.CFRelease(C.CFTypeRef(cPaths))
-
-	for _, p := range paths {
-		p, _ = filepath.Abs(p)
-		cpath := C.CString(p)
-		defer C.free(unsafe.Pointer(cpath))
-
-		str := C.CFStringCreateWithCString(nil, cpath, C.kCFStringEncodingUTF8)
-		C.CFArrayAppendValue(cPaths, unsafe.Pointer(str))
-	}
-
-	if since == 0 {
-		/* If since == 0 is passed to FSEventStreamCreate it will mean 'since the beginning of time'.
-		We remap to 'now'. */
-		since = C.kFSEventStreamEventIdSinceNow + (1 << 64)
-	}
-
-	es := FSEventStream{C: make(chan []FSEvent)}
-	context := C.FSEventStreamContext{info: unsafe.Pointer(&es.C)}
-
-	latency := C.CFTimeInterval(1.0)
-	es.stream = C.EventStreamCreate(&context, cPaths, C.FSEventStreamEventId(since), latency, C.FSEventStreamCreateFlags(flags))
-
-	go func() {
+		runtime.LockOSThread()
 		es.rlref = C.CFRunLoopGetCurrent()
 		C.FSEventStreamScheduleWithRunLoop(es.stream, es.rlref, C.kCFRunLoopDefaultMode)
 		C.FSEventStreamStart(es.stream)
 		C.CFRunLoopRun()
 	}()
 
-	return &es
+	if !es.hasFinalizer {
+		runtime.SetFinalizer(es, finalizer)
+		es.hasFinalizer = true
+	}
 }
 
-func (es *FSEventStream) Flush() {
-	C.FSEventStreamFlushSync(es.stream)
+// Flush events that have occurred but haven't been delivered.
+func (es *EventStream) Flush(sync bool) {
+	if sync {
+		C.FSEventStreamFlushSync(es.stream)
+	} else {
+		C.FSEventStreamFlushAsync(es.stream)
+	}
 }
 
-func (es *FSEventStream) Stop() {
-	C.FSEventStreamStop(es.stream)
-	C.FSEventStreamInvalidate(es.stream)
-	C.FSEventStreamRelease(es.stream)
-	C.CFRunLoopStop(es.rlref)
-	close(es.C)
+// Stop listening to the event stream.
+func (es *EventStream) Stop() {
+	if es.stream != nil {
+		C.FSEventStreamStop(es.stream)
+		C.FSEventStreamInvalidate(es.stream)
+		C.FSEventStreamRelease(es.stream)
+		C.CFRunLoopStop(es.rlref)
+	}
+	es.stream = nil
+}
+
+// Restart listening.
+func (es *EventStream) Restart() {
+	es.Stop()
+	es.Resume = true
+	es.Start()
 }
